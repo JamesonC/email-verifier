@@ -301,7 +301,7 @@ def normalize_email(addr: str) -> str:
 def is_syntax_valid(email: str) -> bool:
     return bool(EMAIL_REGEX.match(email))
 
-def mx_lookup(domain: str, attempts: int = MAX_DNS_ATTEMPTS) -> list[Tuple[int, str]]:
+def mx_lookup(domain: str, attempts: int, backoff_base: float) -> list[Tuple[int, str]]:
     last_exc: Optional[Exception] = None
     for attempt in range(1, attempts + 1):
         try:
@@ -325,7 +325,7 @@ def mx_lookup(domain: str, attempts: int = MAX_DNS_ATTEMPTS) -> list[Tuple[int, 
             last_exc = exc
 
         if attempt < attempts:
-            delay = DNS_BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(0, DNS_BACKOFF_BASE)
+            delay = backoff_base * (2 ** (attempt - 1)) + random.uniform(0, backoff_base)
             time.sleep(delay)
         else:
             if last_exc is not None:
@@ -438,6 +438,10 @@ def verify_single(
     ca_cache: dict,
     connection_pool: Optional[SMTPConnectionPool],
     timeout: int,
+    dns_attempts: int,
+    dns_backoff: float,
+    smtp_attempts: int,
+    smtp_backoff: float,
 ) -> VerifyResult:
     email = normalize_email(email)
     if not email or not is_syntax_valid(email):
@@ -447,7 +451,7 @@ def verify_single(
     # MX cache
     if domain not in domain_cache:
         try:
-            mx_list = mx_lookup(domain)
+            mx_list = mx_lookup(domain, attempts=dns_attempts, backoff_base=dns_backoff)
             domain_cache[domain] = mx_list
         except Exception as e:
             status, reason = classify_dns_exception(e)
@@ -470,6 +474,8 @@ def verify_single(
                     test_addr,
                     connection_pool=connection_pool,
                     timeout=timeout,
+                    attempts=smtp_attempts,
+                    backoff_base=smtp_backoff,
                 )
                 code, msg = outcome.code, outcome.message
                 if code in HARD_FAIL:
@@ -501,6 +507,8 @@ def verify_single(
                 email,
                 connection_pool=connection_pool,
                 timeout=timeout,
+                attempts=smtp_attempts,
+                backoff_base=smtp_backoff,
             )
             code, msg = outcome.code, outcome.message
             last_code, last_msg = code, msg
@@ -554,6 +562,10 @@ async def worker(
     catchall_cache: dict,
     connection_pool: SMTPConnectionPool,
     executor: ThreadPoolExecutor,
+    dns_attempts: int,
+    dns_backoff: float,
+    smtp_attempts: int,
+    smtp_backoff: float,
 ) -> None:
     loop = asyncio.get_running_loop()
     while True:
@@ -579,6 +591,10 @@ async def worker(
             catchall_cache,
             connection_pool,
             args.timeout,
+            dns_attempts,
+            dns_backoff,
+            smtp_attempts,
+            smtp_backoff,
         )
 
         await result_queue.put((idx, {
@@ -594,6 +610,7 @@ async def writer_loop(
     result_queue: "asyncio.Queue[tuple[int, dict[str, str], VerifyResult]]",
     writer: csv.DictWriter,
     counters: Counters,
+    progress_interval: int,
 ) -> None:
     next_index = 0
     pending: dict[int, tuple[dict[str, str], VerifyResult]] = {}
@@ -619,6 +636,12 @@ async def writer_loop(
                 "domain": row_meta["domain"],
                 "provider_response": result.provider_response,
             })
+            if progress_interval and counters.total % progress_interval == 0:
+                print(
+                    f"[progress] processed={counters.total} valid={counters.valid} invalid={counters.invalid} "
+                    f"risky={counters.risky} unknown={counters.unknown} no_mx={counters.nomx} bad_syntax={counters.bad}",
+                    flush=True,
+                )
             next_index += 1
 
         result_queue.task_done()
@@ -636,6 +659,12 @@ async def writer_loop(
             "domain": row_meta["domain"],
             "provider_response": result.provider_response,
         })
+        if progress_interval and counters.total % progress_interval == 0:
+            print(
+                f"[progress] processed={counters.total} valid={counters.valid} invalid={counters.invalid} "
+                f"risky={counters.risky} unknown={counters.unknown} no_mx={counters.nomx} bad_syntax={counters.bad}",
+                flush=True,
+            )
 
 
 async def process_rows(args, reader: csv.DictReader, writer: csv.DictWriter, counters: Counters) -> None:
@@ -649,6 +678,12 @@ async def process_rows(args, reader: csv.DictReader, writer: csv.DictWriter, cou
     catchall_cache: dict[str, str] = {}
 
     concurrency = max(1, args.concurrency)
+    dns_attempts = max(1, args.dns_attempts)
+    dns_backoff = max(0.0, args.dns_backoff)
+    smtp_attempts = max(1, args.smtp_attempts)
+    smtp_backoff = max(0.0, args.smtp_backoff)
+    progress_interval = max(0, args.progress_every)
+
     row_queue: asyncio.Queue[Optional[tuple[int, dict[str, str]]]] = asyncio.Queue(maxsize=concurrency * 4)
     result_queue: asyncio.Queue[tuple[int, dict[str, str], VerifyResult]] = asyncio.Queue(maxsize=concurrency * 4)
 
@@ -656,7 +691,7 @@ async def process_rows(args, reader: csv.DictReader, writer: csv.DictWriter, cou
         args.helo_domain,
         args.timeout,
         use_starttls=True,
-        max_per_host=concurrency,
+        max_per_host=max(1, args.pool_per_host or concurrency),
     )
 
     try:
@@ -673,12 +708,18 @@ async def process_rows(args, reader: csv.DictReader, writer: csv.DictWriter, cou
                         catchall_cache,
                         connection_pool,
                         executor,
+                        dns_attempts,
+                        dns_backoff,
+                        smtp_attempts,
+                        smtp_backoff,
                     )
                 )
                 for i in range(concurrency)
             ]
 
-        writer_task = asyncio.create_task(writer_loop(result_queue, writer, counters))
+        writer_task = asyncio.create_task(
+            writer_loop(result_queue, writer, counters, progress_interval)
+        )
 
         idx = 0
         for row in reader:
@@ -704,6 +745,12 @@ def main():
     ap.add_argument("--timeout", type=int, default=12, help="Seconds SMTP timeout per connection")
     ap.add_argument("--concurrency", type=int, default=4, help="Number of concurrent verification workers")
     ap.add_argument("--per-domain-rate", type=int, default=None, help="Max RCPT probes per minute per domain (default=derived from --rate)")
+    ap.add_argument("--dns-attempts", dest="dns_attempts", type=int, default=MAX_DNS_ATTEMPTS, help="Max DNS lookup attempts per domain")
+    ap.add_argument("--dns-backoff", type=float, default=DNS_BACKOFF_BASE, help="Base seconds for DNS retry backoff")
+    ap.add_argument("--smtp-attempts", type=int, default=MAX_SMTP_ATTEMPTS, help="Max SMTP RCPT attempts per MX host")
+    ap.add_argument("--smtp-backoff", type=float, default=SMTP_BACKOFF_BASE, help="Base seconds for SMTP retry backoff")
+    ap.add_argument("--progress-every", type=int, default=500, help="Print progress every N processed rows (0 to disable)")
+    ap.add_argument("--pool-per-host", type=int, default=None, help="Max pooled SMTP connections per MX host (default=concurrency)")
     args = ap.parse_args()
 
     counters = asyncio.run(run_async(args))
