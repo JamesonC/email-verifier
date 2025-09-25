@@ -7,6 +7,7 @@ An asynchronous, best-effort email deliverability checker that performs MX looku
 - **Async worker pool** with configurable concurrency, global rate limits, and per-domain throttling.
 - **Reusable SMTP connection pool** to avoid repeated TLS handshakes and reduce latency per probe.
 - **DNS and SMTP retries** with exponential backoff and detailed reason codes in the output CSV.
+- **Heuristic tagging** for common role inboxes and disposable-email providers. These contacts are still probed but flagged (e.g., `heuristic:role_account`) and surfaced as `risky_role_account` / `risky_disposable` when they otherwise look valid.
 - **Catch-all detection** that reuses the same retry/backoff policies so ambiguous domains surface as `risky_catchall` rather than `valid`.
 - **Progress logging & resumability** via deterministic CSV ordering and configurable progress intervals.
 - **Plain CSV in/out** so the script fits easily into CRM workflows and can be resumed by skipping already processed rows in the output file.
@@ -31,7 +32,7 @@ pip install dnspython==2.*
 - **Input CSV** must expose at least `hs_object_id` and `email` columns (case-insensitive).
 - **Output CSV** includes: `hs_object_id,email,deliverability_status,reasons,domain,provider_response`.
 
-Deliverability status values: `valid`, `invalid`, `risky_catchall`, `unknown`, `no_mx`, `bad_syntax`.
+Deliverability status values: `valid`, `invalid`, `risky_catchall`, `risky_role_account`, `risky_disposable`, `unknown`, `no_mx`, `bad_syntax`.
 
 ## Quick Start
 
@@ -64,13 +65,14 @@ python email_verifier_mvp.py \
 | `--smtp-attempts` | `3` | Maximum RCPT probes per MX host before giving up. |
 | `--smtp-backoff` | `0.75` | Base seconds for exponential SMTP retry backoff. |
 | `--progress-every` | `500` | Print progress summary after every N processed rows (set `0` to disable). |
+| `--disposable-domain-file` | _optional_ | Path to newline-delimited disposable domains merged with the built-in list. |
 
 ## Operational Guidance
 
 1. **Choose realistic rates.** Start with `--rate 40 --concurrency 8` for moderate throughput (~2,400 RCPT/minute), then adjust based on provider feedback. Keep `--per-domain-rate` low for domains that throttle aggressively.
 2. **Warm up gradually.** Run a small batch (1–2k contacts) and observe `[progress]` logs to ensure DNS/MX failures remain low and the SMTP servers are not rate-limiting.
 3. **Resume support.** If an earlier run generated partial output, rerun the script with a filtered input CSV or deduplicate the contacts before processing. The tool writes results in input order so you can easily find the last processed row.
-4. **Interpret status codes.** The `reasons` column records DNS errors (`dns_timeout`, `dns_nonameservers`), SMTP retry history (`smtp_retry:soft_fail:451`), and final verdict (`smtp_hard_fail:550`). Use this to triage unknowns vs. invalids.
+4. **Interpret status codes.** The `reasons` column records DNS errors (`dns_timeout`, `dns_nonameservers`), SMTP retry history (`smtp_retry:soft_fail:451`), heuristic flags (`heuristic:role_account`), and final verdict (`smtp_hard_fail:550`). Use this to triage unknowns vs. invalids.
 5. **Respect provider policies.** Even though no email is sent (`DATA` is never issued), probing too aggressively may trigger temporary blocks. Vary `--mail-from` if you see policy-related rejections like `5.7.1`.
 
 ## Troubleshooting
@@ -82,7 +84,6 @@ python email_verifier_mvp.py \
 ## Limitations
 
 - Some providers (notably Google and Microsoft) accept RCPT for non-existent users, so the script may return `risky_catchall` even after retries.
-- Disposable or role-based addresses are not filtered automatically; integrate your own heuristics before probing if needed.
 - The tool does not persist intermediate checkpoints; long runs should be supervised and possibly split into multiple CSVs.
 
 ## Contributing

@@ -75,6 +75,36 @@ SMTP_RETRYABLE_EXCEPTIONS = (
     smtplib.SMTPRecipientsRefused,
 )
 
+ROLE_ACCOUNTS = {
+    "admin",
+    "billing",
+    "contact",
+    "customerservice",
+    "enquiries",
+    "help",
+    "hello",
+    "info",
+    "marketing",
+    "newsletter",
+    "noreply",
+    "press",
+    "privacy",
+    "sales",
+    "support",
+    "team",
+}
+
+DEFAULT_DISPOSABLE_DOMAINS = {
+    "mailinator.com",
+    "10minutemail.com",
+    "guerrillamail.com",
+    "tempmail.com",
+    "trashmail.com",
+    "yopmail.com",
+    "dispostable.com",
+    "getnada.com",
+}
+
 @dataclass
 class VerifyResult:
     status: str            # valid | invalid | risky_catchall | unknown | no_mx | bad_syntax
@@ -98,7 +128,7 @@ class Counters:
             self.valid += 1
         elif status == "invalid":
             self.invalid += 1
-        elif status == "risky_catchall":
+        elif status in {"risky_catchall", "risky_role_account", "risky_disposable"}:
             self.risky += 1
         elif status == "no_mx":
             self.nomx += 1
@@ -312,6 +342,33 @@ def normalize_email(addr: str) -> str:
 
 def is_syntax_valid(email: str) -> bool:
     return bool(EMAIL_REGEX.match(email))
+
+
+def load_disposable_domains(path: Optional[str]) -> set[str]:
+    if not path:
+        return set(DEFAULT_DISPOSABLE_DOMAINS)
+
+    domains: set[str] = set(DEFAULT_DISPOSABLE_DOMAINS)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                domain = line.strip().lower()
+                if not domain or domain.startswith("#"):
+                    continue
+                domains.add(domain)
+    except FileNotFoundError:
+        raise SystemExit(f"Disposable domain file not found: {path}")
+    return domains
+
+
+def detect_heuristics(local_part: str, domain: str, disposable_domains: set[str]) -> set[str]:
+    flags: set[str] = set()
+    if local_part in ROLE_ACCOUNTS:
+        flags.add("role_account")
+    if domain and domain in disposable_domains:
+        flags.add("disposable_domain")
+    return flags
+
 
 def mx_lookup(domain: str, attempts: int, backoff_base: float) -> list[Tuple[int, str]]:
     last_exc: Optional[Exception] = None
@@ -590,6 +647,9 @@ async def worker(
         hsid = (row.get("hs_object_id") or "").strip()
         email = normalize_email(row.get("email") or row.get("Email") or "")
         domain = email.split("@")[-1] if "@" in email else ""
+        local = email.split("@")[0] if "@" in email else ""
+
+        heuristics = detect_heuristics(local, domain, args.disposable_domains)
 
         await rate_limiter.acquire(domain)
 
@@ -609,11 +669,33 @@ async def worker(
             smtp_backoff,
         )
 
+        # Enrich result with heuristic flags while preserving underlying verdict
+        updated_result = result
+        if heuristics:
+            reason_list = [r for r in result.reasons.split(";") if r]
+            for flag in sorted(heuristics):
+                reason_list.append(f"heuristic:{flag}")
+
+            base_status = result.status
+            override_status = base_status
+            if "disposable_domain" in heuristics and base_status not in {"invalid", "bad_syntax", "no_mx"}:
+                reason_list.append(f"base_status:{base_status}")
+                override_status = "risky_disposable"
+            elif "role_account" in heuristics and base_status not in {"invalid", "bad_syntax", "no_mx"}:
+                reason_list.append(f"base_status:{base_status}")
+                override_status = "risky_role_account"
+
+            updated_result = VerifyResult(
+                override_status,
+                ";".join(reason_list),
+                result.provider_response,
+            )
+
         await result_queue.put((idx, {
             "hs_object_id": hsid,
             "email": email,
             "domain": domain,
-        }, result))
+        }, updated_result))
 
         row_queue.task_done()
 
@@ -763,7 +845,10 @@ def main():
     ap.add_argument("--smtp-backoff", type=float, default=SMTP_BACKOFF_BASE, help="Base seconds for SMTP retry backoff")
     ap.add_argument("--progress-every", type=int, default=500, help="Print progress every N processed rows (0 to disable)")
     ap.add_argument("--pool-per-host", type=int, default=None, help="Max pooled SMTP connections per MX host (default=concurrency)")
+    ap.add_argument("--disposable-domain-file", type=str, default=None, help="Optional newline-delimited disposable domain list")
     args = ap.parse_args()
+
+    args.disposable_domains = load_disposable_domains(args.disposable_domain_file)
 
     counters = asyncio.run(run_async(args))
 
