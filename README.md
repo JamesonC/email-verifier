@@ -11,6 +11,7 @@ An asynchronous, best-effort email deliverability checker that performs MX looku
 - **Catch-all detection** that reuses the same retry/backoff policies so ambiguous domains surface as `risky_catchall` rather than `valid`.
 - **Progress logging & resumability** via deterministic CSV ordering and configurable progress intervals.
 - **Resume support** that skips previously processed rows and continues appending to the existing output file when `--resume` is enabled.
+- **Post-run summary** written to JSON capturing totals, heuristic counts, and top failing domains for quick triage.
 - **Plain CSV in/out** so the script fits easily into CRM workflows and can be resumed by skipping already processed rows in the output file.
 
 ## Requirements
@@ -68,14 +69,17 @@ python email_verifier_mvp.py \
 | `--progress-every` | `500` | Print progress summary after every N processed rows (set `0` to disable). |
 | `--disposable-domain-file` | _optional_ | Path to newline-delimited disposable domains merged with the built-in list. |
 | `--resume` | `false` | Append to an existing output file, skipping rows already processed. |
+| `--summary` | `<out>.summary.json` | Custom path for the JSON summary report. |
+| `--summary-top-domains` | `15` | How many failing domains to list in the summary. |
 
 ## Operational Guidance
 
 1. **Choose realistic rates.** Start with `--rate 40 --concurrency 8` for moderate throughput (~2,400 RCPT/minute), then adjust based on provider feedback. Keep `--per-domain-rate` low for domains that throttle aggressively.
 2. **Warm up gradually.** Run a small batch (1–2k contacts) and observe `[progress]` logs to ensure DNS/MX failures remain low and the SMTP servers are not rate-limiting.
 3. **Resume support.** Restart a run with `--resume` to append to the existing output file; the script skips rows whose `(hs_object_id, email)` pairs already appear in the CSV and continues logging aggregate totals.
-4. **Interpret status codes.** The `reasons` column records DNS errors (`dns_timeout`, `dns_nonameservers`), SMTP retry history (`smtp_retry:soft_fail:451`), heuristic flags (`heuristic:role_account`), and final verdict (`smtp_hard_fail:550`). Use this to triage unknowns vs. invalids.
-5. **Respect provider policies.** Even though no email is sent (`DATA` is never issued), probing too aggressively may trigger temporary blocks. Vary `--mail-from` if you see policy-related rejections like `5.7.1`.
+4. **Interpret status codes.** The `reasons` column records DNS errors (`dns_timeout`, `dns_nonameservers`), SMTP retry history (`smtp_retry:soft_fail:451`), heuristic flags (`heuristic:role_account`), and final verdict (`smtp_hard_fail:550`). Use this to triage unknowns vs. invalids and correlate with the JSON summary.
+5. **Review the summary.** After each run, inspect `<out>.summary.json` (or your configured path) to see aggregate counts and the domains contributing most to failures; adjust rate limits or disposables accordingly.
+6. **Respect provider policies.** Even though no email is sent (`DATA` is never issued), probing too aggressively may trigger temporary blocks. Vary `--mail-from` if you see policy-related rejections like `5.7.1`.
 
 ## Troubleshooting
 

@@ -46,6 +46,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from email.utils import parseaddr
 import os
+import json
 from typing import Optional, Tuple
 
 try:
@@ -163,6 +164,8 @@ class ResumeState:
     processed_keys: set[tuple[str, str]]
     counters: Counters
     processed_rows: int
+    heuristic_counts: dict[str, int]
+    domain_failures: dict[str, int]
 
 
 class AsyncRateLimiter:
@@ -427,10 +430,12 @@ def classify_dns_exception(exc: Exception) -> Tuple[str, str]:
 def load_resume_state(out_path: str, resume_flag: bool) -> ResumeState:
     counters = Counters()
     if not resume_flag or not os.path.exists(out_path):
-        return ResumeState(False, set(), counters, 0)
+        return ResumeState(False, set(), counters, 0, defaultdict(int), defaultdict(int))
 
     processed_keys: set[tuple[str, str]] = set()
     processed_rows = 0
+    heuristic_counts: dict[str, int] = defaultdict(int)
+    domain_failures: dict[str, int] = defaultdict(int)
 
     try:
         with open(out_path, newline="", encoding="utf-8") as f_out:
@@ -440,11 +445,20 @@ def load_resume_state(out_path: str, resume_flag: bool) -> ResumeState:
                 hsid = (row.get("hs_object_id") or "").strip()
                 email = normalize_email(row.get("email") or "")
                 processed_keys.add((hsid, email))
-                counters.add((row.get("deliverability_status") or "").strip())
+                status = (row.get("deliverability_status") or "").strip()
+                counters.add(status)
+                reasons = (row.get("reasons") or "").split(";")
+                for reason in reasons:
+                    if reason.startswith("heuristic:"):
+                        heuristic_counts[reason[len("heuristic:"):]] += 1
+                if status in {"invalid", "no_mx", "unknown"}:
+                    domain = (row.get("domain") or "").strip().lower()
+                    if domain:
+                        domain_failures[domain] += 1
     except FileNotFoundError:
-        return ResumeState(False, set(), Counters(), 0)
+        return ResumeState(False, set(), Counters(), 0, defaultdict(int), defaultdict(int))
 
-    return ResumeState(True, processed_keys, counters, processed_rows)
+    return ResumeState(True, processed_keys, counters, processed_rows, heuristic_counts, domain_failures)
 
 
 def smtp_probe(
@@ -739,6 +753,7 @@ async def writer_loop(
     writer: csv.DictWriter,
     counters: Counters,
     progress_interval: int,
+    summary_state: dict,
 ) -> None:
     next_index = 0
     pending: dict[int, tuple[dict[str, str], VerifyResult]] = {}
@@ -770,6 +785,16 @@ async def writer_loop(
                     f"risky={counters.risky} unknown={counters.unknown} no_mx={counters.nomx} bad_syntax={counters.bad}",
                     flush=True,
                 )
+            # Update summary data
+            if status in {"invalid", "no_mx", "unknown"}:
+                domain = row_meta["domain"].lower()
+                if domain:
+                    summary_state["domain_failures"][domain] = summary_state["domain_failures"].get(domain, 0) + 1
+            if result.reasons:
+                for reason in result.reasons.split(";"):
+                    if reason.startswith("heuristic:"):
+                        flag = reason[len("heuristic:"):]
+                        summary_state["heuristics"][flag] = summary_state["heuristics"].get(flag, 0) + 1
             next_index += 1
 
         result_queue.task_done()
@@ -793,6 +818,15 @@ async def writer_loop(
                 f"risky={counters.risky} unknown={counters.unknown} no_mx={counters.nomx} bad_syntax={counters.bad}",
                 flush=True,
             )
+        if status in {"invalid", "no_mx", "unknown"}:
+            domain = row_meta["domain"].lower()
+            if domain:
+                summary_state["domain_failures"][domain] = summary_state["domain_failures"].get(domain, 0) + 1
+        if result.reasons:
+            for reason in result.reasons.split(";"):
+                if reason.startswith("heuristic:"):
+                    flag = reason[len("heuristic:"):]
+                    summary_state["heuristics"][flag] = summary_state["heuristics"].get(flag, 0) + 1
 
 
 async def process_rows(
@@ -829,6 +863,10 @@ async def process_rows(
     )
 
     try:
+        summary_state = {
+            "heuristics": dict(resume_state.heuristic_counts),
+            "domain_failures": dict(resume_state.domain_failures),
+        }
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             workers = [
                 asyncio.create_task(
@@ -852,7 +890,7 @@ async def process_rows(
             ]
 
         writer_task = asyncio.create_task(
-            writer_loop(result_queue, writer, counters, progress_interval)
+            writer_loop(result_queue, writer, counters, progress_interval, summary_state)
         )
 
         skipped_existing = 0
@@ -889,6 +927,7 @@ async def process_rows(
         await writer_task
     finally:
         connection_pool.close_all()
+        args.summary_state = summary_state
 
 def main():
     ap = argparse.ArgumentParser()
@@ -908,6 +947,8 @@ def main():
     ap.add_argument("--pool-per-host", type=int, default=None, help="Max pooled SMTP connections per MX host (default=concurrency)")
     ap.add_argument("--disposable-domain-file", type=str, default=None, help="Optional newline-delimited disposable domain list")
     ap.add_argument("--resume", action="store_true", help="Resume from existing output file, skipping rows already processed")
+    ap.add_argument("--summary", type=str, default=None, help="Path for JSON summary (defaults to <out>.summary.json)")
+    ap.add_argument("--summary-top-domains", type=int, default=15, help="Number of top failing domains to include in summary")
     args = ap.parse_args()
 
     args.disposable_domains = load_disposable_domains(args.disposable_domain_file)
@@ -952,6 +993,36 @@ async def run_async(args) -> Counters:
             writer.writeheader()
 
         await process_rows(args, reader, writer, counters, resume_state)
+
+    # After processing, produce summary report
+    summary_path = args.summary or f"{args.out_csv}.summary.json"
+    summary_payload = {
+        "input": os.path.abspath(args.in_csv),
+        "output": os.path.abspath(args.out_csv),
+        "summary": {
+            "total": counters.total,
+            "valid": counters.valid,
+            "invalid": counters.invalid,
+            "risky": counters.risky,
+            "no_mx": counters.nomx,
+            "bad_syntax": counters.bad,
+            "unknown": counters.unknown,
+        },
+        "heuristics": dict(args.summary_state.get("heuristics", {})),
+        "top_domain_failures": sorted(
+            args.summary_state.get("domain_failures", {}).items(),
+            key=lambda x: x[1],
+            reverse=True,
+        )[: args.summary_top_domains],
+    }
+
+    try:
+        with open(summary_path, "w", encoding="utf-8") as fh:
+            json.dump(summary_payload, fh, indent=2)
+        print(f"[summary] wrote {summary_path}")
+    except Exception as exc:
+        print(f"[summary] failed to write summary: {exc}")
+
     return counters
 
 if __name__ == "__main__":
