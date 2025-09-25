@@ -18,6 +18,7 @@ Notes & Caveats:
 """
 
 import argparse
+import asyncio
 import csv
 import random
 import re
@@ -25,7 +26,8 @@ import smtplib
 import socket
 import ssl
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from email.utils import parseaddr
 from typing import Optional, Tuple
@@ -51,6 +53,69 @@ class VerifyResult:
     status: str            # valid | invalid | risky_catchall | unknown | no_mx | bad_syntax
     reasons: str
     provider_response: str = ""
+
+
+@dataclass
+class Counters:
+    total: int = 0
+    valid: int = 0
+    invalid: int = 0
+    risky: int = 0
+    unknown: int = 0
+    nomx: int = 0
+    bad: int = 0
+
+    def add(self, status: str) -> None:
+        self.total += 1
+        if status == "valid":
+            self.valid += 1
+        elif status == "invalid":
+            self.invalid += 1
+        elif status == "risky_catchall":
+            self.risky += 1
+        elif status == "no_mx":
+            self.nomx += 1
+        elif status == "bad_syntax":
+            self.bad += 1
+        else:
+            self.unknown += 1
+
+
+class AsyncRateLimiter:
+    """Sliding-window rate limiter for global and per-domain control."""
+
+    def __init__(self, global_rate: int, per_domain_rate: Optional[int], period: float = 60.0) -> None:
+        self.global_rate = max(0, global_rate)
+        self.per_domain_rate = max(0, per_domain_rate or 0)
+        self.period = period
+        self._global_lock = asyncio.Lock()
+        self._global_events: deque[float] = deque()
+        self._domain_events: dict[str, deque[float]] = defaultdict(deque)
+        self._domain_locks: dict[str, asyncio.Lock] = {}
+
+    async def acquire(self, domain: str) -> None:
+        if self.global_rate:
+            await self._acquire(self._global_lock, self._global_events, self.global_rate)
+        if domain and self.per_domain_rate:
+            lock = self._domain_locks.setdefault(domain, asyncio.Lock())
+            events = self._domain_events[domain]
+            await self._acquire(lock, events, self.per_domain_rate)
+
+    async def _acquire(self, lock: asyncio.Lock, events: deque[float], rate: int) -> None:
+        while True:
+            async with lock:
+                now = time.monotonic()
+                self._trim(events, now)
+                if len(events) < rate:
+                    events.append(now)
+                    return
+                wait_time = self.period - (now - events[0])
+            await asyncio.sleep(max(wait_time, 0.05))
+
+    def _trim(self, events: deque[float], now: float) -> None:
+        threshold = now - self.period
+        while events and events[0] <= threshold:
+            events.popleft()
 
 def normalize_email(addr: str) -> str:
     addr = (addr or "").strip()
@@ -179,6 +244,144 @@ def verify_single(email: str, helo_domain: str, mail_from: str, domain_cache: di
 
     return VerifyResult(verdict, ";".join(reasons), f"{last_code} {last_msg}".strip())
 
+
+async def worker(
+    worker_id: int,
+    row_queue: "asyncio.Queue[Optional[tuple[int, dict[str, str]]]]",
+    result_queue: "asyncio.Queue[tuple[int, dict[str, str], VerifyResult]]",
+    args,
+    rate_limiter: AsyncRateLimiter,
+    domain_cache: dict,
+    catchall_cache: dict,
+    executor: ThreadPoolExecutor,
+) -> None:
+    loop = asyncio.get_running_loop()
+    while True:
+        item = await row_queue.get()
+        if item is None:
+            row_queue.task_done()
+            break
+
+        idx, row = item
+        hsid = (row.get("hs_object_id") or "").strip()
+        email = normalize_email(row.get("email") or row.get("Email") or "")
+        domain = email.split("@")[-1] if "@" in email else ""
+
+        await rate_limiter.acquire(domain)
+
+        result = await loop.run_in_executor(
+            executor,
+            verify_single,
+            email,
+            args.helo_domain,
+            args.mail_from,
+            domain_cache,
+            catchall_cache,
+            args.timeout,
+        )
+
+        await result_queue.put((idx, {
+            "hs_object_id": hsid,
+            "email": email,
+            "domain": domain,
+        }, result))
+
+        row_queue.task_done()
+
+
+async def writer_loop(
+    result_queue: "asyncio.Queue[tuple[int, dict[str, str], VerifyResult]]",
+    writer: csv.DictWriter,
+    counters: Counters,
+) -> None:
+    next_index = 0
+    pending: dict[int, tuple[dict[str, str], VerifyResult]] = {}
+
+    while True:
+        item = await result_queue.get()
+        if item is None:
+            result_queue.task_done()
+            break
+
+        idx, row_meta, result = item
+        pending[idx] = (row_meta, result)
+
+        while next_index in pending:
+            row_meta, result = pending.pop(next_index)
+            status = result.status
+            counters.add(status)
+            writer.writerow({
+                "hs_object_id": row_meta["hs_object_id"],
+                "email": row_meta["email"],
+                "deliverability_status": status,
+                "reasons": result.reasons,
+                "domain": row_meta["domain"],
+                "provider_response": result.provider_response,
+            })
+            next_index += 1
+
+        result_queue.task_done()
+
+    # Flush any stragglers if the sentinel arrives before they were written
+    for idx in sorted(pending.keys()):
+        row_meta, result = pending[idx]
+        status = result.status
+        counters.add(status)
+        writer.writerow({
+            "hs_object_id": row_meta["hs_object_id"],
+            "email": row_meta["email"],
+            "deliverability_status": status,
+            "reasons": result.reasons,
+            "domain": row_meta["domain"],
+            "provider_response": result.provider_response,
+        })
+
+
+async def process_rows(args, reader: csv.DictReader, writer: csv.DictWriter, counters: Counters) -> None:
+    rate_per_min = max(1, args.rate)
+    per_domain_rate = args.per_domain_rate
+    if per_domain_rate is None:
+        per_domain_rate = max(1, rate_per_min // 5) if rate_per_min >= 5 else 1
+
+    rate_limiter = AsyncRateLimiter(rate_per_min, per_domain_rate)
+    domain_cache: dict[str, list[Tuple[int, str]]] = {}
+    catchall_cache: dict[str, str] = {}
+
+    concurrency = max(1, args.concurrency)
+    row_queue: asyncio.Queue[Optional[tuple[int, dict[str, str]]]] = asyncio.Queue(maxsize=concurrency * 4)
+    result_queue: asyncio.Queue[tuple[int, dict[str, str], VerifyResult]] = asyncio.Queue(maxsize=concurrency * 4)
+
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        workers = [
+            asyncio.create_task(
+                worker(
+                    i,
+                    row_queue,
+                    result_queue,
+                    args,
+                    rate_limiter,
+                    domain_cache,
+                    catchall_cache,
+                    executor,
+                )
+            )
+            for i in range(concurrency)
+        ]
+
+        writer_task = asyncio.create_task(writer_loop(result_queue, writer, counters))
+
+        idx = 0
+        for row in reader:
+            await row_queue.put((idx, row))
+            idx += 1
+
+        for _ in workers:
+            await row_queue.put(None)
+
+        await asyncio.gather(*workers)
+        await result_queue.put(None)
+        await writer_task
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in", dest="in_csv", required=True, help="Input CSV with columns hs_object_id,email")
@@ -187,57 +390,42 @@ def main():
     ap.add_argument("--mail-from", default="bounce@localhost", help="MAIL FROM address used in probe")
     ap.add_argument("--rate", type=int, default=12, help="Max RCPT probes per minute (default=12)")
     ap.add_argument("--timeout", type=int, default=12, help="Seconds SMTP timeout per connection")
+    ap.add_argument("--concurrency", type=int, default=4, help="Number of concurrent verification workers")
+    ap.add_argument("--per-domain-rate", type=int, default=None, help="Max RCPT probes per minute per domain (default=derived from --rate)")
     args = ap.parse_args()
 
-    rate_per_min = max(1, args.rate)
-    sleep_between = 60.0 / rate_per_min
+    counters = asyncio.run(run_async(args))
 
-    domain_cache: dict[str, list[Tuple[int, str]]] = {}
-    catchall_cache: dict[str, str] = {}
+    print(
+        "Done. Total={total} valid={valid} invalid={invalid} risky_catchall={risky} "
+        "no_mx={nomx} bad_syntax={bad} unknown={unknown}".format(
+            total=counters.total,
+            valid=counters.valid,
+            invalid=counters.invalid,
+            risky=counters.risky,
+            nomx=counters.nomx,
+            bad=counters.bad,
+            unknown=counters.unknown,
+        )
+    )
 
-    total = 0
-    valid = invalid = risky = unknown = nomx = bad = 0
 
+async def run_async(args) -> Counters:
+    counters = Counters()
     with open(args.in_csv, newline="", encoding="utf-8") as f_in, open(args.out_csv, "w", newline="", encoding="utf-8") as f_out:
         reader = csv.DictReader(f_in)
-        fieldnames = ["hs_object_id", "email", "deliverability_status", "reasons", "domain", "provider_response"]
+        fieldnames = [
+            "hs_object_id",
+            "email",
+            "deliverability_status",
+            "reasons",
+            "domain",
+            "provider_response",
+        ]
         writer = csv.DictWriter(f_out, fieldnames=fieldnames)
         writer.writeheader()
-
-        for row in reader:
-            hsid = (row.get("hs_object_id") or "").strip()
-            email = normalize_email(row.get("email") or row.get("Email") or "")
-            domain = email.split("@")[-1] if "@" in email else ""
-
-            result = verify_single(email, args.helo_domain, args.mail_from, domain_cache, catchall_cache, timeout=args.timeout)
-
-            status = result.status
-            if status == "valid":
-                valid += 1
-            elif status == "invalid":
-                invalid += 1
-            elif status == "risky_catchall":
-                risky += 1
-            elif status == "no_mx":
-                nomx += 1
-            elif status == "bad_syntax":
-                bad += 1
-            else:
-                unknown += 1
-
-            writer.writerow({
-                "hs_object_id": hsid,
-                "email": email,
-                "deliverability_status": status,
-                "reasons": result.reasons,
-                "domain": domain,
-                "provider_response": result.provider_response
-            })
-
-            total += 1
-            time.sleep(sleep_between)
-
-    print(f"Done. Total={total} valid={valid} invalid={invalid} risky_catchall={risky} no_mx={nomx} bad_syntax={bad} unknown={unknown}")
+        await process_rows(args, reader, writer, counters)
+    return counters
 
 if __name__ == "__main__":
     main()
