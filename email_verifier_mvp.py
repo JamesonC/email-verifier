@@ -1,20 +1,32 @@
 #!/usr/bin/env python3
 """
-Email Verifier (MVP) — MX lookup + SMTP RCPT probe + catch‑all detection.
-Reads a CSV with columns: hs_object_id,email
-Writes a CSV with columns: hs_object_id,email,deliverability_status,reasons,domain,provider_response
+Email Verifier (async) — MX lookup + SMTP RCPT probe + catch-all detection with retries.
 
-USAGE:
-  pip install dnspython==2.*
-  python email_verifier_mvp.py --in contacts_in.csv --out contacts_out.csv \
-      --helo-domain yourcompany.com --mail-from bounce@yourcompany.com --rate 10
+INPUT  CSV columns:  hs_object_id,email
+OUTPUT CSV columns: hs_object_id,email,deliverability_status,reasons,domain,provider_response
+
+QUICK START
+    pip install dnspython==2.*
+    python email_verifier_mvp.py --in contacts_in.csv --out contacts_out.csv \
+        --helo-domain yourcompany.com --mail-from bounce@yourcompany.com \
+        --rate 40 --concurrency 8 --progress-every 1000
+
+KEY FLAGS
+    --rate / --per-domain-rate      Global per-minute RCPT limit and optional per-domain cap.
+    --concurrency                   Number of parallel workers (default 4).
+    --pool-per-host                 Max pooled SMTP sessions per MX (default = concurrency).
+    --timeout                       SMTP socket timeout in seconds (default 12).
+    --dns-attempts / --dns-backoff  DNS retry count and base backoff seconds.
+    --smtp-attempts / --smtp-backoff SMTP retry count and base backoff seconds for RCPT probes.
+    --progress-every                Emit progress totals every N rows (0 disables logging).
 
 Notes & Caveats:
-- Many providers (Google/Microsoft) often accept RCPT during SMTP even for bad users (catch‑all or anti‑harvesting), or defer rejection after DATA. Treat such domains as "catchall" or "unknown".
-- Probing too fast can trigger throttling or blocks. Use --rate to limit RCPTs per minute.
+- Many providers (Google/Microsoft) often accept RCPT even for bad users (catch-all or anti-harvesting),
+  or defer rejection after DATA. Treat such domains as "catchall" or "unknown".
+- Probing too fast can trigger throttling or blocks. Use rate + per-domain controls and consider jittering.
 - Never use a null sender for some MTAs; others prefer <>. The default uses a benign MAIL FROM, configurable.
 - This script does NOT send an email (no DATA). It stops after RCPT TO.
-- Results are best‑effort and not perfect. Consider combining with your internal (bounce/quarantine) data.
+- Results are best-effort. Combine with internal bounce/quarantine data where possible.
 """
 
 import argparse
