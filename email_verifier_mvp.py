@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Email Verifier (async) — MX lookup + SMTP RCPT probe + catch-all detection with retries.
+Email Verifier (async) — MX lookup + SMTP RCPT probe + catch-all detection with retries and resume support.
 
 INPUT  CSV columns:  hs_object_id,email
 OUTPUT CSV columns: hs_object_id,email,deliverability_status,reasons,domain,provider_response
@@ -19,6 +19,7 @@ KEY FLAGS
     --dns-attempts / --dns-backoff  DNS retry count and base backoff seconds.
     --smtp-attempts / --smtp-backoff SMTP retry count and base backoff seconds for RCPT probes.
     --progress-every                Emit progress totals every N rows (0 disables logging).
+    --resume                        Append to an existing output CSV, skipping rows already written.
 
 Notes & Caveats:
 - Many providers (Google/Microsoft) often accept RCPT even for bad users (catch-all or anti-harvesting),
@@ -27,6 +28,7 @@ Notes & Caveats:
 - Never use a null sender for some MTAs; others prefer <>. The default uses a benign MAIL FROM, configurable.
 - This script does NOT send an email (no DATA). It stops after RCPT TO.
 - Results are best-effort. Combine with internal bounce/quarantine data where possible.
+- Resume mode expects the existing CSV to be intact with the original header.
 """
 
 import argparse
