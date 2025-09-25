@@ -25,6 +25,7 @@ import re
 import smtplib
 import socket
 import ssl
+import threading
 import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -117,6 +118,151 @@ class AsyncRateLimiter:
         while events and events[0] <= threshold:
             events.popleft()
 
+
+class SMTPConnection:
+    """Thin wrapper around smtplib.SMTP with reusable RCPT probe support."""
+
+    def __init__(self, host: str, helo_domain: str, timeout: int, use_starttls: bool = True) -> None:
+        self.host = host
+        self.helo_domain = helo_domain
+        self.timeout = timeout
+        self.use_starttls = use_starttls
+        self.closed = False
+        self._context = ssl.create_default_context()
+        self.server = self._connect()
+
+    def _connect(self) -> smtplib.SMTP:
+        server = smtplib.SMTP(self.host, 25, timeout=self.timeout)
+        server.set_debuglevel(0)
+        try:
+            server.ehlo(self.helo_domain)
+        except Exception:
+            server.helo(self.helo_domain)
+        if self.use_starttls:
+            try:
+                if server.has_extn("starttls"):
+                    server.starttls(context=self._context)
+                    server.ehlo(self.helo_domain)
+            except Exception:
+                # Leave the connection in plaintext if STARTTLS fails
+                pass
+        return server
+
+    def probe(self, mail_from: str, rcpt_to: str) -> Tuple[int, str]:
+        if self.closed:
+            raise smtplib.SMTPServerDisconnected("SMTP connection already closed")
+
+        try:
+            mail_code, mail_msg = self.server.mail(mail_from)
+            if mail_code >= 400:
+                # Reset transaction before returning
+                try:
+                    self.server.rset()
+                except Exception:
+                    pass
+                message = (mail_msg or b"").decode(errors="ignore")
+                return mail_code, message
+
+            code, msg = self.server.rcpt(rcpt_to)
+            message = (msg or b"").decode(errors="ignore")
+            try:
+                self.server.rset()
+            except Exception:
+                # Some servers may not allow RSET here; ignore
+                pass
+            return code, message
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self.server.quit()
+        except Exception:
+            try:
+                self.server.close()
+            except Exception:
+                pass
+
+
+class SMTPConnectionPool:
+    """Thread-safe SMTP connection pool keyed by MX host."""
+
+    def __init__(
+        self,
+        helo_domain: str,
+        timeout: int,
+        use_starttls: bool = True,
+        max_per_host: int = 4,
+    ) -> None:
+        self.helo_domain = helo_domain
+        self.timeout = timeout
+        self.use_starttls = use_starttls
+        self.max_per_host = max(1, max_per_host)
+        self._lock = threading.Lock()
+        self._available: dict[str, deque[SMTPConnection]] = defaultdict(deque)
+        self._in_use: dict[str, int] = defaultdict(int)
+
+    def acquire(self, host: str) -> SMTPConnection:
+        while True:
+            with self._lock:
+                queue = self._available.get(host)
+                if queue:
+                    conn = queue.popleft()
+                    self._in_use[host] += 1
+                    if conn.closed:
+                        self._in_use[host] -= 1
+                        continue
+                    return conn
+
+                current = self._in_use.get(host, 0)
+                if current < self.max_per_host:
+                    self._in_use[host] = current + 1
+                    create_new = True
+                else:
+                    create_new = False
+
+            if create_new:
+                try:
+                    return SMTPConnection(host, self.helo_domain, self.timeout, self.use_starttls)
+                except Exception:
+                    with self._lock:
+                        self._in_use[host] -= 1
+                    raise
+
+            time.sleep(0.05)
+
+    def release(self, host: str, conn: SMTPConnection, keep: bool = True) -> None:
+        with self._lock:
+            self._in_use[host] = max(self._in_use.get(host, 1) - 1, 0)
+            if keep and not conn.closed:
+                self._available[host].append(conn)
+            else:
+                conn.close()
+            if not self._available[host] and self._in_use[host] == 0:
+                self._available.pop(host, None)
+                self._in_use.pop(host, None)
+
+    def probe(self, host: str, mail_from: str, rcpt_to: str) -> Tuple[int, str]:
+        conn = self.acquire(host)
+        try:
+            return conn.probe(mail_from, rcpt_to)
+        finally:
+            self.release(host, conn, keep=not conn.closed)
+
+    def close_all(self) -> None:
+        with self._lock:
+            for queue in self._available.values():
+                while queue:
+                    conn = queue.popleft()
+                    conn.close()
+            self._available.clear()
+            # Connections in use should be zero here; clear counters for cleanliness
+            self._in_use.clear()
+
 def normalize_email(addr: str) -> str:
     addr = (addr or "").strip()
     name, email = parseaddr(addr)
@@ -132,8 +278,19 @@ def mx_lookup(domain: str) -> list[Tuple[int, str]]:
         mx_records.append((int(rdata.preference), str(rdata.exchange).rstrip(".")))
     return sorted(mx_records, key=lambda x: x[0])
 
-def smtp_probe(mx_host: str, helo_domain: str, mail_from: str, rcpt_to: str, timeout=12, use_starttls=True) -> Tuple[int, str]:
+def smtp_probe(
+    mx_host: str,
+    helo_domain: str,
+    mail_from: str,
+    rcpt_to: str,
+    timeout=12,
+    use_starttls=True,
+    connection_pool: Optional[SMTPConnectionPool] = None,
+) -> Tuple[int, str]:
     """Connect to MX, run (EHLO/HELO), optional STARTTLS, then MAIL FROM/RCPT TO. Return (code, message)."""
+    if connection_pool is not None:
+        return connection_pool.probe(mx_host, mail_from, rcpt_to)
+
     code = -1
     message = ""
     context = ssl.create_default_context()
@@ -162,7 +319,15 @@ def smtp_probe(mx_host: str, helo_domain: str, mail_from: str, rcpt_to: str, tim
 def random_local_part() -> str:
     return "no_such_user_" + "".join(random.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(20))
 
-def verify_single(email: str, helo_domain: str, mail_from: str, domain_cache: dict, ca_cache: dict, timeout: int) -> VerifyResult:
+def verify_single(
+    email: str,
+    helo_domain: str,
+    mail_from: str,
+    domain_cache: dict,
+    ca_cache: dict,
+    connection_pool: Optional[SMTPConnectionPool],
+    timeout: int,
+) -> VerifyResult:
     email = normalize_email(email)
     if not email or not is_syntax_valid(email):
         return VerifyResult("bad_syntax", "failed_regex_or_empty")
@@ -186,7 +351,14 @@ def verify_single(email: str, helo_domain: str, mail_from: str, domain_cache: di
         ca_status = "unknown"
         for _, mx in mx_list[:2]:  # try top 1-2 MX hosts
             try:
-                code, msg = smtp_probe(mx, helo_domain, mail_from, test_addr, timeout=timeout)
+                code, msg = smtp_probe(
+                    mx,
+                    helo_domain,
+                    mail_from,
+                    test_addr,
+                    timeout=timeout,
+                    connection_pool=connection_pool,
+                )
                 if code in HARD_FAIL:
                     ca_status = "not_catchall"
                     break
@@ -209,7 +381,14 @@ def verify_single(email: str, helo_domain: str, mail_from: str, domain_cache: di
     # If domain looks catch‑all, we may still attempt RCPT; result may still be 250
     for _, mx in mx_list[:2]:
         try:
-            code, msg = smtp_probe(mx, helo_domain, mail_from, email, timeout=timeout)
+            code, msg = smtp_probe(
+                mx,
+                helo_domain,
+                mail_from,
+                email,
+                timeout=timeout,
+                connection_pool=connection_pool,
+            )
             last_code, last_msg = code, msg
             if code in HARD_FAIL:
                 verdict = "invalid"
@@ -253,6 +432,7 @@ async def worker(
     rate_limiter: AsyncRateLimiter,
     domain_cache: dict,
     catchall_cache: dict,
+    connection_pool: SMTPConnectionPool,
     executor: ThreadPoolExecutor,
 ) -> None:
     loop = asyncio.get_running_loop()
@@ -277,6 +457,7 @@ async def worker(
             args.mail_from,
             domain_cache,
             catchall_cache,
+            connection_pool,
             args.timeout,
         )
 
@@ -351,22 +532,31 @@ async def process_rows(args, reader: csv.DictReader, writer: csv.DictWriter, cou
     row_queue: asyncio.Queue[Optional[tuple[int, dict[str, str]]]] = asyncio.Queue(maxsize=concurrency * 4)
     result_queue: asyncio.Queue[tuple[int, dict[str, str], VerifyResult]] = asyncio.Queue(maxsize=concurrency * 4)
 
-    with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        workers = [
-            asyncio.create_task(
-                worker(
-                    i,
-                    row_queue,
-                    result_queue,
-                    args,
-                    rate_limiter,
-                    domain_cache,
-                    catchall_cache,
-                    executor,
+    connection_pool = SMTPConnectionPool(
+        args.helo_domain,
+        args.timeout,
+        use_starttls=True,
+        max_per_host=concurrency,
+    )
+
+    try:
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            workers = [
+                asyncio.create_task(
+                    worker(
+                        i,
+                        row_queue,
+                        result_queue,
+                        args,
+                        rate_limiter,
+                        domain_cache,
+                        catchall_cache,
+                        connection_pool,
+                        executor,
+                    )
                 )
-            )
-            for i in range(concurrency)
-        ]
+                for i in range(concurrency)
+            ]
 
         writer_task = asyncio.create_task(writer_loop(result_queue, writer, counters))
 
@@ -381,6 +571,8 @@ async def process_rows(args, reader: csv.DictReader, writer: csv.DictWriter, cou
         await asyncio.gather(*workers)
         await result_queue.put(None)
         await writer_task
+    finally:
+        connection_pool.close_all()
 
 def main():
     ap = argparse.ArgumentParser()
