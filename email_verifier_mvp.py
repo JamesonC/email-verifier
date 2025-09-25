@@ -35,6 +35,7 @@ from typing import Optional, Tuple
 
 try:
     import dns.resolver
+    import dns.exception
 except ImportError as e:
     raise SystemExit("Missing dependency dnspython. Install with: pip install dnspython") from e
 
@@ -48,6 +49,19 @@ EMAIL_REGEX = re.compile(
 HARD_FAIL = {550, 551, 553, 554, 521}
 SOFT_FAIL = {421, 450, 451, 452, 447}
 AMBIGUOUS = {252, 551}  # 551 can be user not local; relay, so ambiguous
+
+MAX_DNS_ATTEMPTS = 3
+MAX_SMTP_ATTEMPTS = 3
+DNS_BACKOFF_BASE = 0.5
+SMTP_BACKOFF_BASE = 0.75
+SMTP_RETRYABLE_EXCEPTIONS = (
+    socket.timeout,
+    ConnectionResetError,
+    smtplib.SMTPServerDisconnected,
+    smtplib.SMTPConnectError,
+    smtplib.SMTPHeloError,
+    smtplib.SMTPRecipientsRefused,
+)
 
 @dataclass
 class VerifyResult:
@@ -80,6 +94,22 @@ class Counters:
             self.bad += 1
         else:
             self.unknown += 1
+
+
+@dataclass
+class SMTPProbeOutcome:
+    code: int
+    message: str
+    attempts: int
+    history: list[str]
+
+
+class SMTPProbeRetryError(Exception):
+    def __init__(self, exc: Exception, attempts: int, history: list[str]) -> None:
+        super().__init__(str(exc))
+        self.exc = exc
+        self.attempts = attempts
+        self.history = history
 
 
 class AsyncRateLimiter:
@@ -271,12 +301,48 @@ def normalize_email(addr: str) -> str:
 def is_syntax_valid(email: str) -> bool:
     return bool(EMAIL_REGEX.match(email))
 
-def mx_lookup(domain: str) -> list[Tuple[int, str]]:
-    answers = dns.resolver.resolve(domain, "MX")
-    mx_records = []
-    for rdata in answers:
-        mx_records.append((int(rdata.preference), str(rdata.exchange).rstrip(".")))
-    return sorted(mx_records, key=lambda x: x[0])
+def mx_lookup(domain: str, attempts: int = MAX_DNS_ATTEMPTS) -> list[Tuple[int, str]]:
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            answers = dns.resolver.resolve(
+                domain,
+                "MX",
+                lifetime=10.0,
+                raise_on_no_answer=False,
+            )
+            mx_records = []
+            if answers.rrset is None:
+                return mx_records
+            for rdata in answers:
+                mx_records.append((int(rdata.preference), str(rdata.exchange).rstrip(".")))
+            return sorted(mx_records, key=lambda x: x[0])
+        except dns.resolver.NXDOMAIN:
+            raise
+        except (dns.resolver.Timeout, dns.exception.Timeout, dns.resolver.NoNameservers, dns.resolver.LifetimeTimeout) as exc:
+            last_exc = exc
+        except dns.exception.DNSException as exc:
+            last_exc = exc
+
+        if attempt < attempts:
+            delay = DNS_BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(0, DNS_BACKOFF_BASE)
+            time.sleep(delay)
+        else:
+            if last_exc is not None:
+                raise last_exc
+    return []
+
+
+def classify_dns_exception(exc: Exception) -> Tuple[str, str]:
+    if isinstance(exc, dns.resolver.NXDOMAIN):
+        return "no_mx", "dns_nxdomain"
+    if isinstance(exc, dns.resolver.NoAnswer):
+        return "no_mx", "dns_no_answer"
+    if isinstance(exc, dns.resolver.NoNameservers):
+        return "unknown", "dns_nonameservers"
+    if isinstance(exc, (dns.resolver.Timeout, dns.exception.Timeout, dns.resolver.LifetimeTimeout)):
+        return "unknown", "dns_timeout"
+    return "unknown", f"dns_error:{exc.__class__.__name__}"
 
 def smtp_probe(
     mx_host: str,
@@ -316,6 +382,51 @@ def smtp_probe(
         message = (msg or b"").decode(errors="ignore")
     return code, message
 
+
+def smtp_probe_with_retry(
+    mx_host: str,
+    helo_domain: str,
+    mail_from: str,
+    rcpt_to: str,
+    connection_pool: Optional[SMTPConnectionPool],
+    timeout: int,
+    attempts: int = MAX_SMTP_ATTEMPTS,
+    backoff_base: float = SMTP_BACKOFF_BASE,
+) -> SMTPProbeOutcome:
+    history: list[str] = []
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            code, msg = smtp_probe(
+                mx_host,
+                helo_domain,
+                mail_from,
+                rcpt_to,
+                timeout=timeout,
+                connection_pool=connection_pool,
+            )
+
+            if code in SOFT_FAIL and attempt < attempts:
+                history.append(f"soft_fail:{code}")
+                delay = backoff_base * (2 ** (attempt - 1)) + random.uniform(0, backoff_base)
+                time.sleep(delay)
+                continue
+
+            return SMTPProbeOutcome(code=code, message=msg, attempts=attempt, history=history)
+        except SMTP_RETRYABLE_EXCEPTIONS as exc:
+            last_exc = exc
+            history.append(f"exception:{exc.__class__.__name__}")
+            if attempt >= attempts:
+                raise SMTPProbeRetryError(exc, attempt, history) from exc
+            delay = backoff_base * (2 ** (attempt - 1)) + random.uniform(0, backoff_base)
+            time.sleep(delay)
+
+    if last_exc is not None:
+        raise SMTPProbeRetryError(last_exc, max(1, attempts), history) from last_exc
+
+    raise SMTPProbeRetryError(RuntimeError("smtp_retry_failed"), max(1, attempts), history)
+
 def random_local_part() -> str:
     return "no_such_user_" + "".join(random.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(20))
 
@@ -339,7 +450,8 @@ def verify_single(
             mx_list = mx_lookup(domain)
             domain_cache[domain] = mx_list
         except Exception as e:
-            return VerifyResult("no_mx", f"mx_lookup_error:{e.__class__.__name__}")
+            status, reason = classify_dns_exception(e)
+            return VerifyResult(status, reason)
 
     mx_list = domain_cache[domain]
     if not mx_list:
@@ -351,14 +463,15 @@ def verify_single(
         ca_status = "unknown"
         for _, mx in mx_list[:2]:  # try top 1-2 MX hosts
             try:
-                code, msg = smtp_probe(
+                outcome = smtp_probe_with_retry(
                     mx,
                     helo_domain,
                     mail_from,
                     test_addr,
-                    timeout=timeout,
                     connection_pool=connection_pool,
+                    timeout=timeout,
                 )
+                code, msg = outcome.code, outcome.message
                 if code in HARD_FAIL:
                     ca_status = "not_catchall"
                     break
@@ -366,8 +479,8 @@ def verify_single(
                     # If accepted or ambiguous, lean to catch‑all (not definitive)
                     ca_status = "catchall_suspected"
                     # don't break immediately; try another MX for confirmation
-            except (socket.timeout, smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError, smtplib.SMTPHeloError, smtplib.SMTPRecipientsRefused) as e:
-                # transient or refused; keep trying others
+            except SMTPProbeRetryError:
+                # transient or refused even after retries; keep trying others
                 continue
             except Exception:
                 continue
@@ -381,15 +494,20 @@ def verify_single(
     # If domain looks catch‑all, we may still attempt RCPT; result may still be 250
     for _, mx in mx_list[:2]:
         try:
-            code, msg = smtp_probe(
+            outcome = smtp_probe_with_retry(
                 mx,
                 helo_domain,
                 mail_from,
                 email,
-                timeout=timeout,
                 connection_pool=connection_pool,
+                timeout=timeout,
             )
+            code, msg = outcome.code, outcome.message
             last_code, last_msg = code, msg
+            if outcome.history:
+                reasons.extend(f"smtp_retry:{entry}" for entry in outcome.history)
+            if outcome.attempts > 1:
+                reasons.append(f"smtp_attempts:{outcome.attempts}")
             if code in HARD_FAIL:
                 verdict = "invalid"
                 reasons.append(f"smtp_hard_fail:{code}")
@@ -408,8 +526,10 @@ def verify_single(
                 reasons.append(f"smtp_ambiguous:{code}")
             else:
                 reasons.append(f"smtp_other:{code}")
-        except (socket.timeout, smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError) as e:
-            reasons.append(f"socket_or_smtp_error:{e.__class__.__name__}")
+        except SMTPProbeRetryError as e:
+            reasons.extend(f"smtp_retry:{entry}" for entry in e.history)
+            reasons.append(f"smtp_retry_error:{e.exc.__class__.__name__}")
+            reasons.append(f"smtp_retry_attempts:{e.attempts}")
             continue
         except Exception as e:
             reasons.append(f"error:{e.__class__.__name__}")
