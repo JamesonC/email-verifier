@@ -11,6 +11,13 @@ QUICK START
         --helo-domain yourcompany.com --mail-from bounce@yourcompany.com \
         --rate 40 --concurrency 8 --progress-every 1000
 
+DIRECT RUN EXAMPLE
+    python email_verifier_mvp.py --in contacts_in.csv --out contacts_out.csv \
+        --helo-domain sockclub.com --mail-from bounce@sockclub.com \
+        --rate 40 --per-domain-rate 5 --concurrency 6 --progress-every 1000 \
+        --resume --summary contacts_out.summary.json --summary-top-domains 20
+
+
 KEY FLAGS
     --rate / --per-domain-rate      Global per-minute RCPT limit and optional per-domain cap.
     --concurrency                   Number of parallel workers (default 4).
