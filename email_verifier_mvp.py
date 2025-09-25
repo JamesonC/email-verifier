@@ -43,6 +43,7 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from email.utils import parseaddr
+import os
 from typing import Optional, Tuple
 
 try:
@@ -152,6 +153,14 @@ class SMTPProbeRetryError(Exception):
         self.exc = exc
         self.attempts = attempts
         self.history = history
+
+
+@dataclass
+class ResumeState:
+    enabled: bool
+    processed_keys: set[tuple[str, str]]
+    counters: Counters
+    processed_rows: int
 
 
 class AsyncRateLimiter:
@@ -412,6 +421,29 @@ def classify_dns_exception(exc: Exception) -> Tuple[str, str]:
     if isinstance(exc, (dns.resolver.Timeout, dns.exception.Timeout, dns.resolver.LifetimeTimeout)):
         return "unknown", "dns_timeout"
     return "unknown", f"dns_error:{exc.__class__.__name__}"
+
+def load_resume_state(out_path: str, resume_flag: bool) -> ResumeState:
+    counters = Counters()
+    if not resume_flag or not os.path.exists(out_path):
+        return ResumeState(False, set(), counters, 0)
+
+    processed_keys: set[tuple[str, str]] = set()
+    processed_rows = 0
+
+    try:
+        with open(out_path, newline="", encoding="utf-8") as f_out:
+            reader = csv.DictReader(f_out)
+            for row in reader:
+                processed_rows += 1
+                hsid = (row.get("hs_object_id") or "").strip()
+                email = normalize_email(row.get("email") or "")
+                processed_keys.add((hsid, email))
+                counters.add((row.get("deliverability_status") or "").strip())
+    except FileNotFoundError:
+        return ResumeState(False, set(), Counters(), 0)
+
+    return ResumeState(True, processed_keys, counters, processed_rows)
+
 
 def smtp_probe(
     mx_host: str,
@@ -761,7 +793,13 @@ async def writer_loop(
             )
 
 
-async def process_rows(args, reader: csv.DictReader, writer: csv.DictWriter, counters: Counters) -> None:
+async def process_rows(
+    args,
+    reader: csv.DictReader,
+    writer: csv.DictWriter,
+    counters: Counters,
+    resume_state: ResumeState,
+) -> None:
     rate_per_min = max(1, args.rate)
     per_domain_rate = args.per_domain_rate
     if per_domain_rate is None:
@@ -815,10 +853,31 @@ async def process_rows(args, reader: csv.DictReader, writer: csv.DictWriter, cou
             writer_loop(result_queue, writer, counters, progress_interval)
         )
 
-        idx = 0
+        skipped_existing = 0
+        queued = 0
         for row in reader:
-            await row_queue.put((idx, row))
-            idx += 1
+            hsid_raw = (row.get("hs_object_id") or "").strip()
+            email_norm = normalize_email(row.get("email") or row.get("Email") or "")
+            key = (hsid_raw, email_norm)
+            if resume_state.enabled and key in resume_state.processed_keys:
+                skipped_existing += 1
+                continue
+            await row_queue.put((queued, row))
+            queued += 1
+
+        if resume_state.enabled and resume_state.processed_rows:
+            print(
+                f"[resume] existing rows found: {resume_state.processed_rows}, skipped during enqueue: {skipped_existing}",
+                flush=True,
+            )
+        elif skipped_existing:
+            print(
+                f"[resume] skipped {skipped_existing} rows (already processed)",
+                flush=True,
+            )
+
+        if queued == 0:
+            print("[resume] no new rows to process", flush=True)
 
         for _ in workers:
             await row_queue.put(None)
@@ -846,6 +905,7 @@ def main():
     ap.add_argument("--progress-every", type=int, default=500, help="Print progress every N processed rows (0 to disable)")
     ap.add_argument("--pool-per-host", type=int, default=None, help="Max pooled SMTP connections per MX host (default=concurrency)")
     ap.add_argument("--disposable-domain-file", type=str, default=None, help="Optional newline-delimited disposable domain list")
+    ap.add_argument("--resume", action="store_true", help="Resume from existing output file, skipping rows already processed")
     args = ap.parse_args()
 
     args.disposable_domains = load_disposable_domains(args.disposable_domain_file)
@@ -867,8 +927,12 @@ def main():
 
 
 async def run_async(args) -> Counters:
-    counters = Counters()
-    with open(args.in_csv, newline="", encoding="utf-8") as f_in, open(args.out_csv, "w", newline="", encoding="utf-8") as f_out:
+    resume_state = load_resume_state(args.out_csv, args.resume)
+    counters = resume_state.counters
+
+    mode = "a" if resume_state.enabled and resume_state.processed_rows > 0 else "w"
+
+    with open(args.in_csv, newline="", encoding="utf-8") as f_in, open(args.out_csv, mode, newline="", encoding="utf-8") as f_out:
         reader = csv.DictReader(f_in)
         fieldnames = [
             "hs_object_id",
@@ -879,8 +943,13 @@ async def run_async(args) -> Counters:
             "provider_response",
         ]
         writer = csv.DictWriter(f_out, fieldnames=fieldnames)
-        writer.writeheader()
-        await process_rows(args, reader, writer, counters)
+        if mode == "w":
+            writer.writeheader()
+        elif resume_state.processed_rows == 0:
+            # Existing file without data; ensure header present
+            writer.writeheader()
+
+        await process_rows(args, reader, writer, counters, resume_state)
     return counters
 
 if __name__ == "__main__":
