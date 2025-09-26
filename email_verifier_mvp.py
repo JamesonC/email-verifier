@@ -896,42 +896,42 @@ async def process_rows(
                 for i in range(concurrency)
             ]
 
-        writer_task = asyncio.create_task(
-            writer_loop(result_queue, writer, counters, progress_interval, summary_state)
-        )
-
-        skipped_existing = 0
-        queued = 0
-        for row in reader:
-            hsid_raw = (row.get("hs_object_id") or "").strip()
-            email_norm = normalize_email(row.get("email") or row.get("Email") or "")
-            key = (hsid_raw, email_norm)
-            if resume_state.enabled and key in resume_state.processed_keys:
-                skipped_existing += 1
-                continue
-            await row_queue.put((queued, row))
-            queued += 1
-
-        if resume_state.enabled and resume_state.processed_rows:
-            print(
-                f"[resume] existing rows found: {resume_state.processed_rows}, skipped during enqueue: {skipped_existing}",
-                flush=True,
-            )
-        elif skipped_existing:
-            print(
-                f"[resume] skipped {skipped_existing} rows (already processed)",
-                flush=True,
+            writer_task = asyncio.create_task(
+                writer_loop(result_queue, writer, counters, progress_interval, summary_state)
             )
 
-        if queued == 0:
-            print("[resume] no new rows to process", flush=True)
+            skipped_existing = 0
+            queued = 0
+            for row in reader:
+                hsid_raw = (row.get("hs_object_id") or "").strip()
+                email_norm = normalize_email(row.get("email") or row.get("Email") or "")
+                key = (hsid_raw, email_norm)
+                if resume_state.enabled and key in resume_state.processed_keys:
+                    skipped_existing += 1
+                    continue
+                await row_queue.put((queued, row))
+                queued += 1
 
-        for _ in workers:
-            await row_queue.put(None)
+            if resume_state.enabled and resume_state.processed_rows:
+                print(
+                    f"[resume] existing rows found: {resume_state.processed_rows}, skipped during enqueue: {skipped_existing}",
+                    flush=True,
+                )
+            elif skipped_existing:
+                print(
+                    f"[resume] skipped {skipped_existing} rows (already processed)",
+                    flush=True,
+                )
 
-        await asyncio.gather(*workers)
-        await result_queue.put(None)
-        await writer_task
+            if queued == 0:
+                print("[resume] no new rows to process", flush=True)
+
+            for _ in workers:
+                await row_queue.put(None)
+
+            await asyncio.gather(*workers)
+            await result_queue.put(None)
+            await writer_task
     finally:
         connection_pool.close_all()
         args.summary_state = summary_state
