@@ -81,6 +81,94 @@ python email_verifier_mvp.py \
 5. **Review the summary.** After each run, inspect `<out>.summary.json` (or your configured path) to see aggregate counts and the domains contributing most to failures; adjust rate limits or disposables accordingly.
 6. **Respect provider policies.** Even though no email is sent (`DATA` is never issued), probing too aggressively may trigger temporary blocks. Vary `--mail-from` if you see policy-related rejections like `5.7.1`.
 
+## Running from a DigitalOcean VPS (recommended)
+
+Most residential and corporate networks block outbound SMTP (port 25), so the quickest way to perform MX/RCPT verification is from an isolated VPS where you control egress. The steps below use DigitalOcean, but any provider with open SMTP works similarly.
+
+1. **Create the Droplet**
+   - Sign in to DigitalOcean → **Create → Droplets**.
+   - Image: *Ubuntu 22.04 LTS* (or latest stable).
+   - Plan: the $6/month Basic (1 vCPU, 1GB RAM) is sufficient.
+   - Region: choose one close to your team.
+   - Authentication: upload your SSH public key (`~/.ssh/id_rsa.pub`) or let DO generate a root password (they email it).
+   - Click **Create Droplet** and note the public IPv4 address once it’s ready.
+
+2. **SSH into the Droplet**
+   ```bash
+   ssh root@<droplet-ip>
+   ```
+   If you used the emailed password, change it when prompted. Optionally create a non-root user:
+   ```bash
+   adduser verifier
+   usermod -aG sudo verifier
+   su - verifier
+   ```
+
+3. **Install prerequisites**
+   ```bash
+   sudo apt-get update
+   sudo apt-get install -y python3 python3-venv python3-pip git
+   ```
+
+4. **Bring the project over**
+   - Option A: clone from git
+     ```bash
+     git clone <your-repo-url>
+     cd email-verifier
+     ```
+   - Option B: copy from your laptop
+     ```bash
+     scp -r /path/to/email-verifier verifier@<droplet-ip>:~/email-verifier
+     cd email-verifier
+     ```
+
+5. **Set up the virtual environment**
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   pip install --upgrade pip
+   pip install dnspython==2.*
+   ```
+   Install any extra dependencies your fork requires.
+
+6. **Upload the input CSV (if not already)**
+   ```bash
+   scp contacts_in.csv verifier@<droplet-ip>:~/email-verifier/
+   ```
+   Confirm the file exists with `ls`.
+
+7. **Run the verifier**
+   ```bash
+   python email_verifier_mvp.py \
+     --in contacts_in.csv \
+     --out contacts_out.csv \
+     --helo-domain yourdomain.com \
+     --mail-from bounce@yourdomain.com \
+     --rate 40 \
+     --per-domain-rate 5 \
+     --concurrency 6 \
+     --progress-every 1000 \
+     --resume \
+     --summary contacts_out.summary.json \
+     --summary-top-domains 20
+   ```
+   Tail progress with `tail -f contacts_out.csv` or watch the `[progress]` logs.
+
+8. **Retrieve results**
+   ```bash
+   scp verifier@<droplet-ip>:~/email-verifier/contacts_out.csv .
+   scp verifier@<droplet-ip>:~/email-verifier/contacts_out.summary.json .
+   ```
+
+9. **Shut down (optional)**
+   If you no longer need the droplet, destroy it in the DigitalOcean dashboard to avoid charges. Otherwise, keep it patched (`sudo apt-get upgrade`) and reuse it for future batches.
+
+**Safety notes**
+- Use a dedicated VPS/IP separate from production email traffic.
+- Keep rate limits polite (≤40 RCPTs/min global, ≤5 per domain until you observe behavior).
+- Ensure your `--helo-domain`/`--mail-from` use a domain you control with proper DNS/RDNS.
+- Respect remote servers: follow deferrals, avoid hammering catch-all or tarp domains, and honor any explicit opt-out requests.
+
 ## Troubleshooting
 
 - **Many `dns_timeout` reasons:** Increase `--dns-attempts` or `--dns-backoff`, or inspect your resolver’s health.
