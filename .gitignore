@@ -1,3 +1,10 @@
 .venv/
 __pycache__/
 *.pyc
+
+# verification artifacts
+contacts_in.csv
+contacts_out.csv
+contacts_out.summary.json
+contacts_*.csv
+*.summary.json
